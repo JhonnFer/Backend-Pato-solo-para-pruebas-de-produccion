@@ -1,9 +1,10 @@
-import { TransactionalEmailsApi, SendSmtpEmail } from "@getbrevo/brevo";
+import SibApiV3Sdk from "sib-api-v3-sdk";
 import dotenv from "dotenv";
 dotenv.config();
 
-const client = new TransactionalEmailsApi();
-client.authentications["api-key"].apiKey = process.env.BREVO_API_KEY;
+const client = new SibApiV3Sdk.TransactionalEmailsApi();
+const apiKey = client.authentications["api-key"];
+apiKey.apiKey = process.env.BREVO_API_KEY;
 
 //  REGISTRO
 const sendMailToRegister = async (userMail, token) => {
