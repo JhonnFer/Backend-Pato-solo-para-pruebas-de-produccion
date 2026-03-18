@@ -1,8 +1,5 @@
 import mongoose from "mongoose";
-import {
-  sendMailToRegister,
-  sendMailToRecoveryPassword,
-} from "../config/mailer.js";
+
 import users from "../models/users.js";
 import { crearTokenJWT } from "../middlewares/JWT.js";
 import Evento from "../models/Evento.js";
