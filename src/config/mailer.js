@@ -1,8 +1,8 @@
-import * as Brevo from "@getbrevo/brevo";
+import SibApiV3Sdk from "@getbrevo/brevo";
 import dotenv from "dotenv";
 dotenv.config();
 
-const client = new Brevo.TransactionalEmailsApi();
+const client = new SibApiV3Sdk.TransactionalEmailsApi();
 client.authentications["api-key"].apiKey = process.env.BREVO_API_KEY;
 
 // 📩 REGISTRO
