@@ -1,0 +1,852 @@
+import mongoose from "mongoose"  
+import users from '../models/users.js';
+import { v2 as cloudinary } from 'cloudinary';
+import fs from 'fs-extra';
+import { generarConRetry, getModel } from "../helpers/gemini_helper.js";
+import path from 'path';
+import { v4 as uuidv4 } from 'uuid';
+import Evento from '../models/Evento.js';
+import { Stripe } from "stripe"
+import Chat from '../models/chats.js';
+import Aporte from '../models/Aporte.js';
+import { injectIO } from "../middlewares/injectIO.js";
+import Strike from '../models/strikes.js';
+import HistorialConChatbot from "../models/historialConChatbot.js";
+import HistorialNotificacion from '../models/HistorialNotificacion.js';
+
+const stripe = new Stripe(`${process.env.STRIPE_PRIVATE_KEY}`)
+
+const getCloudinaryPublicIdFromUrl = (url) => {
+  if (!url || typeof url !== 'string') return null;
+  const match = url.match(/\/upload\/(?:v\d+\/)?(.+)\.[a-zA-Z0-9]+$/);
+  return match ? match[1] : null;
+};
+
+const uploadFilesToCloudinary = async (files, folder = 'Estudiantes/Galeria') => {
+  if (!files) return [];
+  const fileArray = Array.isArray(files) ? files : [files];
+  const uploaded = [];
+
+  for (const file of fileArray) {
+    const tempPath = file.tempFilePath || file.path;
+    const result = await cloudinary.uploader.upload(tempPath, { folder });
+    uploaded.push({ url: result.secure_url, public_id: result.public_id });
+
+    // Intentar borrar el archivo temporal (no crítico)
+    try {
+      if (tempPath) await fs.unlink(tempPath);
+    } catch (err) {
+      // Ignorar errores de borrado temporal
+    }
+  }
+
+  return uploaded;
+};
+
+const crearNotificacion = async ({ usuarioId, fromUserId = null , tipo, titulo, mensaje }) => {
+  try {
+    await HistorialNotificacion.create({
+      usuario: usuarioId,
+      fromUser: fromUserId,
+      tipo,
+      titulo,
+      mensaje,
+      leido: false
+    });
+  } catch (error) {
+    console.error('Error creando notificación:', error);
+  }
+};
+
+const obtenerNotificaciones = async (req, res) => {
+  try {
+    const usuarioId = req.userBDD._id;
+    const notificaciones = await HistorialNotificacion.find({ usuario: usuarioId })
+      .populate('fromUser', 'nombre imagenPerfil')
+      .sort({ createdAt: -1 })
+      .lean();
+    return res.status(200).json({ notificaciones });
+  } catch (error) {
+    console.error('Error al obtener notificaciones:', error);
+    return res.status(500).json({ msg: 'Error al obtener notificaciones' });
+  }
+};
+
+const marcarNotificacionLeida = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const usuarioId = req.userBDD._id;
+
+    const notificacion = await HistorialNotificacion.findOne({ _id: id, usuario: usuarioId });
+    if (!notificacion) return res.status(404).json({ msg: 'Notificación no encontrada' });
+
+    notificacion.leido = true;
+    await notificacion.save();
+
+    return res.status(200).json({ msg: 'Notificación marcada como leída' });
+  } catch (error) {
+    console.error('Error marcando notificación como leída:', error);
+    return res.status(500).json({ msg: 'Error al marcar notificación' });
+  }
+};
+
+const logout = (req, res) => {
+  return res.status(200).json({ msg: 'Sesión cerrada. Guarda el token localmente removido en frontend.' });
+};
+
+const completarPerfil = async (req, res) => {
+  try {
+    const id = req.userBDD._id;
+
+    // Extraer y normalizar datos (ajustado para FormData)
+    const nombre = req.body.nombre?.trim();
+    const biografia = req.body.biografia?.trim();
+    const intereses = req.body.intereses?.split(',').map(i => i.trim()) || [];
+    const genero = req.body.genero?.toLowerCase();
+    const orientacion = req.body.orientacion?.toLowerCase();
+    const fechaNacimiento = req.body.fechaNacimiento;
+    const ciudad = req.body['ubicacion[ciudad]']?.trim(); 
+    const pais = req.body['ubicacion[pais]']?.trim(); 
+
+    // Validar campos obligatorios
+    if (!nombre || !biografia || !fechaNacimiento || !genero || !orientacion || intereses.length === 0 || !ciudad || !pais) {
+      return res.status(400).json({ msg: "Por favor, completa todos los campos obligatorios." });
+    }
+
+    // Buscar al usuario
+    const usuario = await users.findById(id);
+    if (!usuario) return res.status(404).json({ msg: "Usuario no encontrado." });
+
+    // Subir imagen a Cloudinary si se envió
+    if (req.files?.imagenPerfil) {
+      const file = req.files.imagenPerfil.tempFilePath;
+      const resultado = await cloudinary.uploader.upload(file, {
+        folder: 'Estudiantes'
+      });
+      usuario.imagenPerfil = resultado.secure_url;
+      // await fs.unlink(file); // borrar imagen temporal (comentado porque a veces da problemas)
+    }
+
+    // Subir imágenes de galería (puede venir como un solo archivo o un arreglo)
+    const galeriaFiles = req.files?.imagenesGaleria || req.files?.galeria;
+    if (galeriaFiles) {
+      const uploads = await uploadFilesToCloudinary(galeriaFiles);
+      const urls = uploads.map(u => u.url);
+      usuario.imagenesGaleria = Array.isArray(usuario.imagenesGaleria)
+        ? [...usuario.imagenesGaleria, ...urls]
+        : urls;
+    }
+
+    // Actualizar campos
+    usuario.nombre = nombre;
+    usuario.biografia = biografia;
+    usuario.intereses = intereses;
+    usuario.genero = genero;
+    usuario.orientacion = orientacion;
+    usuario.fechaNacimiento = fechaNacimiento;
+    // Asignar la ubicación correctamente
+    usuario.ubicacion = { ciudad, pais };
+
+    // Por si no están inicializados
+    usuario.activo = true;
+    usuario.matches = usuario.matches || [];
+    usuario.seguidores = usuario.seguidores || [];
+    usuario.siguiendo = usuario.siguiendo || [];
+    usuario.imagenesGaleria = usuario.imagenesGaleria || [];
+
+    await usuario.save();
+
+    // AÑADIDO: Actualizar la sesión con el usuario recién guardado
+    req.userBDD = usuario;
+
+    // Limpiar respuesta
+    const { password, token, __v, createdAt, updatedAt, ...perfil } = usuario.toObject();
+
+    res.status(200).json({
+      msg: "Perfil actualizado correctamente",
+      perfilActualizado: perfil
+    });
+
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({ msg: "Error en el servidor al actualizar el perfil" });
+  }
+};
+
+const agregarFotosGaleria = async (req, res) => {
+  try {
+    const id = req.userBDD._id;
+    const user = await users.findById(id);
+    if (!user) return res.status(404).json({ msg: "Usuario no encontrado." });
+
+    const galeriaFiles = req.files?.imagenesGaleria || req.files?.galeria;
+    if (!galeriaFiles) {
+      return res.status(400).json({ msg: "No se recibieron archivos. Envía los archivos en form-data bajo el campo 'imagenesGaleria'" });
+    }
+
+    const uploads = await uploadFilesToCloudinary(galeriaFiles);
+    const urls = uploads.map(u => u.url);
+
+    user.imagenesGaleria = Array.isArray(user.imagenesGaleria)
+      ? [...user.imagenesGaleria, ...urls]
+      : urls;
+
+    await user.save();
+
+    return res.status(200).json({ msg: "Imágenes guardadas en la galería", imagenesGaleria: user.imagenesGaleria });
+  } catch (error) {
+    console.error("Error agregando imágenes de galería:", error);
+    return res.status(500).json({ msg: "Error al agregar imágenes de galería" });
+  }
+};
+
+const eliminarFotoGaleria = async (req, res) => {
+  try {
+    const id = req.userBDD._id;
+    const { url } = req.body;
+
+    if (!url) {
+      return res.status(400).json({ msg: "Se requiere la URL de la imagen a eliminar" });
+    }
+
+    const user = await users.findById(id);
+    if (!user) return res.status(404).json({ msg: "Usuario no encontrado." });
+
+    const exists = Array.isArray(user.imagenesGaleria) && user.imagenesGaleria.includes(url);
+    if (!exists) {
+      return res.status(404).json({ msg: "Imagen no encontrada en la galería" });
+    }
+
+    const publicId = getCloudinaryPublicIdFromUrl(url);
+    if (publicId) {
+      await cloudinary.uploader.destroy(publicId);
+    }
+
+    user.imagenesGaleria = user.imagenesGaleria.filter(img => img !== url);
+    await user.save();
+
+    return res.status(200).json({ msg: "Imagen eliminada con éxito", imagenesGaleria: user.imagenesGaleria });
+  } catch (error) {
+    console.error("Error eliminando imagen de galería:", error);
+    return res.status(500).json({ msg: "Error al eliminar imagen de galería" });
+  }
+};
+
+const reemplazarFotoGaleria = async (req, res) => {
+  try {
+    const id = req.userBDD._id;
+    const index = Number(req.params.index);
+    const file = req.files?.imagen;
+
+    if (Number.isNaN(index) || index < 0) {
+      return res.status(400).json({ msg: "Índice inválido" });
+    }
+
+    if (!file) {
+      return res.status(400).json({ msg: "Se requiere un archivo para reemplazar" });
+    }
+
+    const user = await users.findById(id);
+    if (!user) return res.status(404).json({ msg: "Usuario no encontrado." });
+
+    if (!Array.isArray(user.imagenesGaleria) || index >= user.imagenesGaleria.length) {
+      return res.status(400).json({ msg: "Índice fuera de rango" });
+    }
+
+    const oldUrl = user.imagenesGaleria[index];
+    const uploads = await uploadFilesToCloudinary(file);
+    const newUrl = uploads[0]?.url;
+
+    if (!newUrl) {
+      return res.status(500).json({ msg: "No se pudo subir la nueva imagen" });
+    }
+
+    const publicIdOld = getCloudinaryPublicIdFromUrl(oldUrl);
+    if (publicIdOld) {
+      await cloudinary.uploader.destroy(publicIdOld);
+    }
+
+    user.imagenesGaleria[index] = newUrl;
+    await user.save();
+
+    return res.status(200).json({ msg: "Imagen actualizada con éxito", imagenesGaleria: user.imagenesGaleria });
+  } catch (error) {
+    console.error("Error reemplazando imagen de galería:", error);
+    return res.status(500).json({ msg: "Error al reemplazar imagen de galería" });
+  }
+};
+
+const chatEstudiante = async (req, res) => {
+  try {
+    const { mensaje } = req.body;
+    const usuarioId = req.userBDD._id;
+
+    if (!mensaje) {
+      return res.status(400).json({ msg: "Debes enviar un mensaje" });
+    }
+
+    const model = getModel();
+
+    const prompt = `
+Eres un asistente amigable en una app de citas llamada Amikuna. 
+Ayudas a los usuarios a iniciar conversaciones, mejorar sus perfiles y dar consejos de relaciones de manera divertida y respetuosa. 
+Responde siempre con un tono informal pero con buena ortografía.
+Recuerda que eres un chatbot y no puedes recibir mensajes de voz, imágenes o videos, solo texto y debes
+responder de esa manera sin la recepción de lo anteriormente mencionado solo texto (si puedes usar emojis).
+Usa lenguaje natural, que no parezca escrito por una IA.
+Usa jerga y expresiones de Ecuador.
+
+Mensaje del usuario: "${mensaje}"
+`;
+
+    const texto = await generarConRetry(model, prompt);
+
+    await HistorialConChatbot.findOneAndUpdate(
+      { usuario: usuarioId },
+      {
+        $push: {
+          mensajes: {
+            $each: [
+              { rol: "usuario",    contenido: mensaje },
+              { rol: "asistente", contenido: texto   }
+            ]
+          }
+        }
+      },
+      { upsert: true, new: true }  
+    );
+
+    res.status(200).json({ respuesta: texto });
+
+  } catch (error) {
+    console.error("Error con Gemini:", error);
+    if (error.status === 429) {
+      return res.status(429).json({ msg: "Límite alcanzado, intenta en unos segundos." });
+    }
+    res.status(500).json({ msg: "Error interno al consultar", error: error.message });
+  }
+};
+
+const obtenerHistorialChatbot = async (req, res) => {
+  try {
+    const usuarioId = req.userBDD._id;
+
+    const historial = await HistorialConChatbot.findOne({ usuario: usuarioId });
+
+    if (!historial) {
+      return res.status(200).json({ mensajes: [] });
+    }
+
+    res.status(200).json({ mensajes: historial.mensajes });
+
+  } catch (error) {
+    console.error("Error al obtener historial:", error);
+    res.status(500).json({ msg: "Error al obtener historial" });
+  }
+};
+
+const obtenerPerfilCompleto = async (req, res) => {
+  try {
+    const usuario = await users.findById(req.userBDD._id).select('-password -token -__v -createdAt -updatedAt');
+    if (!usuario) return res.status(404).json({ msg: "Usuario no encontrado" });
+
+    res.status(200).json(usuario);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ msg: "Error al obtener el perfil completo" });
+  }
+};
+
+
+const listarPotencialesMatches = async (req, res) => {
+  try {
+    const yo = req.userBDD;
+
+    // Verificar autenticación
+    if (!yo) {
+      return res.status(401).json({ msg: "Usuario no autenticado" });
+    }
+
+    // Filtrar por género opuesto (o mismo si es 'otro')
+    let filtroGenero = {};
+    if (yo.genero === "hombre") filtroGenero.genero = "mujer";
+    if (yo.genero === "mujer") filtroGenero.genero = "hombre";
+    if (yo.genero === "otro") filtroGenero.genero = "otro";
+
+    // Buscar perfiles que cumplan los requisitos
+    let perfiles = await users.find({
+      _id: { $ne: yo._id }, // que no sea yo
+      ...filtroGenero,
+      imagenPerfil: { $ne: "" }, // tiene foto
+      biografia: { $ne: "" }, // tiene bio
+      intereses: { $exists: true, $not: { $size: 0 } } // tiene intereses
+    })
+      .select("-password -token -__v -updatedAt")
+      .lean();
+
+    // Filtrar perfiles que ya sean match
+    perfiles = perfiles.filter(perfil => {
+      const yoSigo = Array.isArray(yo.siguiendo) &&
+                     yo.siguiendo.some(id => id.toString() === perfil._id.toString());
+
+      const elMeSigue = Array.isArray(perfil.siguiendo) &&
+                        perfil.siguiendo.some(id => id.toString() === yo._id.toString());
+
+      // Incluir solo si NO hay match mutuo
+      return !(yoSigo && elMeSigue);
+    });
+
+    // Filtrar perfiles ya vistos
+    perfiles = perfiles.filter(perfil => {
+      return !Array.isArray(yo.perfilesVistos) ||
+             !yo.perfilesVistos.some(id => id.toString() === perfil._id.toString());
+    });
+
+    return res.status(200).json(perfiles);
+
+  } catch (error) {
+    console.error("Error en listarPotencialesMatches:", error);
+    return res.status(500).json({
+      msg: "Error interno del servidor al listar matches",
+      error: error.message
+    });
+  }
+};
+
+// Cambio documentar
+const seguirUsuario = async (req, res) => {
+  try {
+    const yoId = req.userBDD._id;
+    const { idSeguido } = req.params;
+
+    // Validaciones básicas (las que ya tenías)
+    if (yoId.toString() === idSeguido) {
+      return res.status(400).json({ msg: "No puedes seguirte a ti mismo" });
+    }
+
+    const [yo, otro] = await Promise.all([
+      users.findById(yoId),
+      users.findById(idSeguido)
+    ]);
+
+    if (!otro) return res.status(404).json({ msg: "Usuario no encontrado" });
+
+    // Lógica de seguir/dejar de seguir (existente)
+    const yaLoSigo = yo.siguiendo.includes(idSeguido);
+    if (yaLoSigo) {
+      yo.siguiendo.pull(idSeguido);
+      otro.seguidores.pull(yoId);
+      
+      // Opcional: Eliminar match si existía
+      yo.matches.pull(idSeguido);
+      otro.matches.pull(yoId);
+    } else {
+      yo.siguiendo.push(idSeguido);
+      otro.seguidores.push(yoId);
+      
+      // Agregar a perfiles vistos
+      if (!yo.perfilesVistos.includes(idSeguido)) {
+        yo.perfilesVistos.push(idSeguido);
+      }
+
+      // Notificación de nuevo seguidor
+      await crearNotificacion({
+        usuarioId: idSeguido,
+        fromUserId: yoId,
+        tipo: 'seguidor',
+        titulo: 'Tienes un nuevo seguidor',
+        mensaje: `${yo.nombre} ${yo.apellido ?? ''} te está siguiendo.`
+      });
+    }
+
+    // Nuevo: Sistema de matches automáticos
+    let huboMatch = false;
+    if (!yaLoSigo && otro.siguiendo.includes(yoId)) {
+      if (!yo.matches.includes(idSeguido)) {
+        yo.matches.push(idSeguido);
+      }
+      if (!otro.matches.includes(yoId)) {
+        otro.matches.push(yoId);
+      }
+      huboMatch = true;
+
+      await crearNotificacion({
+        usuarioId: yoId,
+        fromUserId: idSeguido,
+        tipo: 'match',
+        titulo: '¡Nuevo match!',
+        mensaje: `¡Felicitaciones! Hiciste match con ${otro.nombre ?? 'alguien'}.`
+      });
+      await crearNotificacion({
+        usuarioId: idSeguido,
+        tipo: 'match',
+        titulo: '¡Nuevo match!',
+        mensaje: `¡Felicitaciones! Hiciste match con ${yo.nombre ?? 'alguien'}.`
+      });
+
+      // Opcional: Crear chat (si tienes esta función)
+      if (req.io) {
+        await guardarMatch(yoId, idSeguido, req.io);
+      }
+    }
+
+    await Promise.all([yo.save(), otro.save()]);
+
+    // Respuesta mejorada
+    return res.status(200).json({
+      msg: yaLoSigo 
+        ? "Has dejado de seguir" 
+        : huboMatch 
+          ? "¡Match! Ahora pueden chatear" 
+          : "Ahora sigues a este usuario",
+      siguiendo: yo.siguiendo.length,
+      huboMatch
+    });
+
+  } catch (error) {
+    console.error("Error en seguirUsuario:", error);
+    return res.status(500).json({ msg: "Error interno del servidor" });
+  }
+};
+
+
+const listarMatches = async (req, res) => {
+  try {
+    const usuario = await users.findById(req.userBDD._id);
+
+    console.log("Usuario sin populate:", usuario);
+
+    const usuarioConPopulate = await users.findById(req.userBDD._id)
+      .populate({
+        path: 'matches',
+      });
+
+    console.log("Matches con populate:", usuarioConPopulate.matches);
+
+    res.status(200).json(usuarioConPopulate.matches);
+
+  } catch (error) {
+    console.error("Error al listar matches:", error);
+    res.status(500).json({ msg: "Error al listar matches", error: error.message });
+  }
+};
+
+const obtenerEventos = async (req, res) => {
+  try {
+    const eventosRaw = await Evento.find({ activo: true })
+      //  populamos ambos arrays
+      .populate('asistentes', 'nombre apellido')
+      .populate('noAsistiran', 'nombre apellido')
+      
+      .select("-__v -createdAt -updatedAt -creador")
+      .lean();
+
+    const eventos = eventosRaw.map(evento => ({
+      ...evento,
+      _id: evento._id.toString(),
+    }));
+     
+    res.status(200).json(eventos);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ msg: "Error al obtener eventos" });
+  }
+};
+
+
+
+const confirmarAsistencia = async (req, res) => {
+  try {
+    const { idEvento } = req.params;
+
+    if (!idEvento || !mongoose.Types.ObjectId.isValid(idEvento)) {
+      return res.status(400).json({ msg: "ID de evento inválido o no recibido" });
+    }
+
+    const userId = req.userBDD._id;
+
+    const evento = await Evento.findById(idEvento);
+    if (!evento) return res.status(404).json({ msg: "Evento no encontrado" });
+
+    if (!evento.asistentes.includes(userId)) {
+      evento.asistentes.push(userId);
+      evento.noAsistiran = evento.noAsistiran.filter(id => id.toString() !== userId.toString());
+    }
+
+    await evento.save();
+    res.status(200).json({ msg: "Asistencia confirmada" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ msg: "Error al confirmar asistencia" });
+  }
+};
+
+const rechazarAsistencia = async (req, res) => {
+  try {
+    const { idEvento } = req.params;
+
+    if (!idEvento || !mongoose.Types.ObjectId.isValid(idEvento)) {
+      return res.status(400).json({ msg: "ID de evento inválido o no recibido" });
+    }
+
+    const userId = req.userBDD._id;
+
+    const evento = await Evento.findById(idEvento);
+    if (!evento) return res.status(404).json({ msg: "Evento no encontrado" });
+
+    if (!evento.noAsistiran.includes(userId)) {
+      evento.noAsistiran.push(userId);
+      evento.asistentes = evento.asistentes.filter(id => id.toString() !== userId.toString());
+    }
+
+    await evento.save();
+    res.status(200).json({ msg: "Asistencia rechazada" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ msg: "Error al rechazar asistencia" });
+  }
+};
+
+/// NADA DOCUMENTADO DE AQUÍ EN ADELANTE PILAS
+
+const crearAporte = async (req, res) => {
+  try {
+    const { amount, paymentMethodId } = req.body;
+    const userId = req.userBDD._id;
+
+    // 1. Crear intento de pago en Stripe
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amount * 100, // Stripe trabaja en centavos
+      currency: "usd",
+      payment_method: paymentMethodId,
+      confirm: true,
+      return_url: "https://amikuna.vercel.app/user/dashboard",
+    });
+
+    // 2. Guardar en la base de datos
+    const nuevoAporte = await Aporte.create({
+      userId,
+      amount,
+      paymentIntentId: paymentIntent.id,
+      status: paymentIntent.status === "succeeded" ? "pagado" : "pendiente",
+    });
+
+    res.status(201).json({
+      ok: true,
+      mensaje: "Aporte creado exitosamente.",
+      aporte: nuevoAporte,
+    });
+  } catch (error) {
+    console.error("Error al procesar aporte:", error);
+    res.status(500).json({
+      ok: false,
+      mensaje: "Error al crear el aporte.",
+      error: error.message,
+    });
+  }
+};
+
+const iniciarChat = async (req, res) => {
+  try {
+    const myId = req.userBDD?._id;
+    const otherUserId = req.params?.otroUserId;
+
+    // Validaciones previas (como ya tienes)...
+
+    // IDs ordenados para buscar el chat único
+    const sortedIds = [myId.toString(), otherUserId.toString()].sort();
+
+    // Buscar si ya existe chat entre estos dos usuarios
+    let chatExistente = await Chat.findOne({
+      participantes: sortedIds
+    });
+
+    if (!chatExistente) {
+      // Si no existe, crear uno nuevo
+      chatExistente = await Chat.create({
+        participantes: sortedIds,
+        mensajes: []
+      });
+
+      // Emitir eventos Socket.io para chat creado
+      if (req.io) {
+        req.io.to(myId.toString()).emit('chat:created', {
+          chatId: chatExistente._id,
+          otherUserId: otherUserId
+        });
+
+        req.io.to(otherUserId.toString()).emit('chat:created', {
+          chatId: chatExistente._id,
+          otherUserId: myId
+        });
+      }
+    }
+
+    // Responder con el chat existente o creado
+    return res.status(200).json({
+      success: true,
+      message: 'Chat listo',
+      chatId: chatExistente._id
+    });
+
+  } catch (error) {
+    console.error('Error en iniciarChat:', error);
+    return res.status(500).json({
+      error: 'Error interno del servidor',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+
+
+const enviarMensaje = async (req, res) => {
+    try {
+        const { chatId } = req.params;
+        const { contenido } = req.body;
+        const emisorId = req.userBDD._id;
+
+        if (!contenido || !chatId) {
+            return res.status(400).json({ msg: 'Contenido y chatId requeridos' });
+        }
+
+        const chat = await Chat.findById(chatId);
+        if (!chat || !chat.participantes.some(p => p.toString() === emisorId.toString())) {
+            return res.status(403).json({ msg: 'No tienes permiso para enviar mensajes en este chat' });
+        }
+
+        const nuevoMensaje = {
+            emisor: emisorId,
+            contenido,
+            createdAt: new Date()
+        };
+
+        const chatActualizado = await Chat.findByIdAndUpdate(
+            chatId,
+            { $push: { mensajes: nuevoMensaje } },
+            { new: true, runValidators: true } 
+        );
+
+        if (!chatActualizado) {
+            return res.status(404).json({ msg: 'Chat no encontrado durante la actualización' });
+        }
+
+        // Poblar la información del emisor en el último mensaje para que el otro usuario lo reciba completo
+        const mensajeFinal = await Chat.populate(chatActualizado, {
+            path: 'mensajes.emisor',
+            select: 'nombre imagenPerfil'
+        });
+
+        // El mensaje que se envía ahora contiene la info del emisor
+        const ultimoMensaje = mensajeFinal.mensajes[mensajeFinal.mensajes.length - 1];
+
+        if (req.io) {
+            req.io.to(chatId.toString()).emit('mensaje:nuevo', {
+                chatId,
+                mensaje: ultimoMensaje
+            });
+        }
+
+        res.status(201).json({
+            msg: 'Mensaje enviado',
+            mensaje: ultimoMensaje
+        });
+
+    } catch (error) {
+        console.error('Error al enviar mensaje:', error);
+        res.status(500).json({ msg: 'Error interno del servidor' });
+    }
+};
+
+const obtenerMensajes = async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const userId = req.userBDD._id;
+
+    const chat = await Chat.findById(chatId).populate('mensajes.emisor', 'nombre imagenPerfil');
+
+    if (!chat) {
+      return res.status(404).json({ msg: 'Chat no encontrado' });
+    }
+
+    const esParticipante = chat.participantes.some(p =>
+      p.toString() === userId.toString()
+    );
+    if (!esParticipante) {
+      return res.status(403).json({ msg: 'No tienes permiso para ver este chat' });
+    }
+
+    res.status(200).json(chat.mensajes);
+
+  } catch (error) {
+    console.error('Error al obtener mensajes:', error);
+    res.status(500).json({ msg: 'Error interno del servidor' });
+  }
+};
+
+const enviarStrike = async (req, res) => {
+  try {
+    const de = req.userBDD._id;
+    const { tipo, razon } = req.body;
+
+    // Buscar el ID del admin quemado
+    const admin = await users.findOne({ correo: 'admin@epn.edu.ec' });
+
+    if (!admin) {
+      return res.status(500).json({ msg: 'Administrador no encontrado en el sistema' });
+    }
+
+    // Validaciones
+    if (!['queja', 'sugerencia'].includes(tipo)) {
+      return res.status(400).json({ msg: "Tipo debe ser 'queja' o 'sugerencia'" });
+    }
+
+    if (!razon || razon.trim().length < 5) {
+      return res.status(400).json({ msg: "La razón debe tener al menos 5 caracteres" });
+    }
+
+    // Crear strike dirigido al admin
+    const nuevoStrike = new Strike({
+      de,
+      para: admin._id,
+      tipo,
+      razon
+    });
+
+    await nuevoStrike.save();
+
+    res.status(201).json({
+      msg: `Tu ${tipo} ha sido enviada al administrador. Pronto revisará tu mensaje.`
+    });
+
+  } catch (error) {
+    console.error("Error al enviar queja/sugerencia:", error);
+    res.status(500).json({ msg: "Error interno del servidor" });
+  }
+};
+
+
+export { 
+  completarPerfil,
+  agregarFotosGaleria,
+  eliminarFotoGaleria,
+  reemplazarFotoGaleria,
+  chatEstudiante,
+  obtenerPerfilCompleto, 
+  listarPotencialesMatches,
+  seguirUsuario,
+  listarMatches,
+  obtenerEventos,
+  confirmarAsistencia,
+  rechazarAsistencia,
+  obtenerNotificaciones,
+  marcarNotificacionLeida,
+  logout,
+  crearAporte,
+  iniciarChat,
+  enviarMensaje,
+  obtenerMensajes,
+  enviarStrike,
+  obtenerHistorialChatbot
+}
+
