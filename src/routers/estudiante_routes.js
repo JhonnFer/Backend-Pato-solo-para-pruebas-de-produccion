@@ -1,7 +1,8 @@
 import {Router} from 'express'
 import { completarPerfil, agregarFotosGaleria, eliminarFotoGaleria, reemplazarFotoGaleria, chatEstudiante,  listarPotencialesMatches, seguirUsuario, listarMatches, obtenerPerfilCompleto, 
-    obtenerEventos, confirmarAsistencia, rechazarAsistencia, obtenerNotificaciones, marcarNotificacionLeida, logout, enviarMensaje, obtenerMensajes,
-    crearAporte, iniciarChat, enviarStrike, obtenerHistorialChatbot
+    obtenerEventos, obtenerMisEventos, confirmarAsistencia, rechazarAsistencia, obtenerNotificaciones, marcarNotificacionLeida, marcarNotificacionLeidaPorStrike, logout, enviarMensaje, obtenerMensajes,
+    crearOrdenPayPal, getPayPalToken, capturarPagoPayPal, iniciarChat, enviarStrike, obtenerHistorialChatbot, verMisStrikes,
+    reportarUsuarioChat
   } from '../controllers/estudiante_controllers.js'
 import {verificarTokenJWT, } from '../middlewares/JWT.js'
 import { perfilCompleto } from '../middlewares/perfilCompleto.js'
@@ -35,6 +36,8 @@ router.get("/matches", verificarTokenJWT, perfilCompleto, listarPotencialesMatch
 
 // Ruta para obtener los eventos creados
 router.get("/ver-eventos", verificarTokenJWT, perfilCompleto, obtenerEventos);
+// Ver eventos a los que el estudiante está inscrito + asistentes de cada evento
+router.get("/mis-eventos", verificarTokenJWT, perfilCompleto, obtenerMisEventos);
 
 // Asistir al evento 
 router.post("/asistir/:idEvento", verificarTokenJWT, confirmarAsistencia);
@@ -44,7 +47,7 @@ router.post("/no-asistir/:idEvento", verificarTokenJWT, rechazarAsistencia);
 
 // Probar Estos 3 endpoitns cuando el Jhonn me siga
 // Endpoint clave y genera el match
-router.post("/seguir/:idSeguido", verificarTokenJWT, perfilCompleto, seguirUsuario);
+router.post("/seguir/:idSeguido", verificarTokenJWT, perfilCompleto, injectIO, seguirUsuario);
 
 // Listar Matches
 router.get("/listarmatches", verificarTokenJWT, perfilCompleto, listarMatches);
@@ -55,8 +58,10 @@ router.post('/chat-con-match/:otroUserId', verificarTokenJWT, injectIO, iniciarC
 router.post("/chats/:chatId/mensajes", verificarTokenJWT, injectIO, enviarMensaje);
 // Obtener mensaje
 router.get("/chats/:chatId/ver-mensajes", verificarTokenJWT, injectIO, obtenerMensajes);
+
 // Pasarela para aporte 
-router.post("/aportes", verificarTokenJWT, crearAporte);
+router.post("/aportes/crear-orden", verificarTokenJWT, crearOrdenPayPal);
+router.post("/aportes/capturar-pago", verificarTokenJWT, capturarPagoPayPal);
 
 // Logout
 router.post('/logout', verificarTokenJWT, logout);
@@ -64,5 +69,12 @@ router.post('/logout', verificarTokenJWT, logout);
 // Enviar queja sugerencia al admin 
 router.post('/strike', verificarTokenJWT, enviarStrike);
 
+router.post('/chats/:chatId/report', verificarTokenJWT, reportarUsuarioChat);
+
+// Ver mis quejas/sugerencias y sus respuestas
+router.get('/mis-strikes', verificarTokenJWT, verMisStrikes);
+
+// Marcar notificación de respuesta de strike como leída usando strikeId
+router.put('/notificaciones/strike/:strikeId/leido', verificarTokenJWT, marcarNotificacionLeidaPorStrike);
 
 export default router 

@@ -6,9 +6,12 @@ import Evento from "../models/Evento.js";
 import cloudinary from "cloudinary";
 import fs from "fs-extra";
 import Strike from "../models/strikes.js";
-import HistorialNotificacion from '../models/HistorialNotificacion.js';
-//nuevas importaciones para admin
+import Chat from "../models/chats.js";
+import HistorialNotificacion from "../models/HistorialNotificacion.js";
+
+//nuevas importaciones para correos reemplaxo de nodemailer por supabase
 import supabase from "../config/supabase.js";
+import crypto from "crypto";
 
 // registro para que supabase use su sistema de correo en lugar del nuestro, pero manteniendo la lógica de creación de usuario en MongoDB y el token personalizado.
 
@@ -43,23 +46,22 @@ const registro = async (req, res) => {
       email,
       options: {
         emailRedirectTo: confirmationLink,
-        data: { nombre, apellido }
-      }
+        data: { nombre, apellido },
+      },
     });
 
     if (error) throw error;
 
     console.log("✅ Email de confirmación enviado:", email);
-
   } catch (error) {
     console.error("❌ Error enviando correo:", error.message);
     return res.status(500).json({
-      msg: "Usuario registrado pero hubo un problema al enviar el correo."
+      msg: "Usuario registrado pero hubo un problema al enviar el correo.",
     });
   }
 
   return res.status(200).json({
-    msg: "Revisa tu correo electrónico para confirmar tu cuenta"
+    msg: "Revisa tu correo electrónico para confirmar tu cuenta",
   });
 };
 
@@ -74,65 +76,93 @@ const confirmarMail = async (req, res) => {
   res.status(200).json({ msg: "Token confirmado, ya puedes iniciar sesión" });
 };
 
+
+
+
 const recuperarPassword = async (req, res) => {
   const { email } = req.body;
-  if (Object.values(req.body).includes(""))
-    return res
-      .status(404)
-      .json({ msg: "Lo sentimos, debes llenar todos los campos" });
-  const userBDD = await users.findOne({ email });
-  if (!userBDD)
-    return res
-      .status(404)
-      .json({ msg: "Lo sentimos, el usuario no se encuentra registrado" });
-  const token = userBDD.crearToken();
-  userBDD.token = token;
-  await sendMailToRecoveryPassword(email, token);
-  await userBDD.save();
-  res
-    .status(200)
-    .json({
-      msg: "Revisa tu correo electrónico para reestablecer tu contraseña",
-    });
-};
 
+  if (!email) {
+    return res.status(400).json({ msg: "El correo es obligatorio" });
+  }
+
+  const userBDD = await users.findOne({ email });
+  if (!userBDD) {
+    return res.status(404).json({ msg: "Usuario no registrado" });
+  }
+
+  //  Generar token seguro
+  const token = crypto.randomBytes(32).toString("hex");
+
+  userBDD.token = token;
+  userBDD.tokenExpira = Date.now() + 1000 * 60 * 60; // 1 hora
+  await userBDD.save();
+
+  //  Link REAL de tu sistema
+  const recoveryLink = `${process.env.URL_FRONTEND}/nuevopassword/${token}`;
+
+  try {
+    //  Usamos Supabase SOLO para disparar el correo
+    await supabase.auth.signInWithOtp({
+      email,
+      options: {
+        emailRedirectTo: recoveryLink,
+      },
+    });
+
+    return res.status(200).json({
+      msg: "Revisa tu correo para recuperar tu contraseña",
+    });
+  } catch (error) {
+    return res.status(500).json({
+      msg: "Error enviando correo",
+    });
+  }
+};
 
 const comprobarTokenPasword = async (req, res) => {
   const { token } = req.params;
-  const userBDD = await users.findOne({ token });
-  if (userBDD?.token !== req.params.token)
-    return res
-      .status(404)
-      .json({ msg: "Lo sentimos, no se puede validar la cuenta" });
-  await userBDD.save();
-  res
-    .status(200)
-    .json({ msg: "Token confirmado, ya puedes crear tu nuevo password" });
+
+  const userBDD = await users.findOne({
+    token,
+    tokenExpira: { $gt: Date.now() },
+  });
+
+  if (!userBDD) {
+    return res.status(404).json({ msg: "Token inválido o expirado" });
+  }
+
+  res.json({ msg: "Token válido" });
 };
 
 const crearNuevoPassword = async (req, res) => {
+  const { token } = req.params;
   const { password, confirmpassword } = req.body;
-  if (Object.values(req.body).includes(""))
-    return res
-      .status(404)
-      .json({ msg: "Lo sentimos, debes llenar todos los campos" });
-  if (password != confirmpassword)
-    return res
-      .status(404)
-      .json({ msg: "Lo sentimos, los passwords no coinciden" });
-  const userBDD = await users.findOne({ token: req.params.token });
-  if (userBDD?.token !== req.params.token)
-    return res
-      .status(404)
-      .json({ msg: "Lo sentimos, no se puede validar la cuenta" });
-  userBDD.token = null;
+
+  if (!password || !confirmpassword) {
+    return res.status(400).json({ msg: "Todos los campos son obligatorios" });
+  }
+
+  if (password !== confirmpassword) {
+    return res.status(400).json({ msg: "Las contraseñas no coinciden" });
+  }
+
+  const userBDD = await users.findOne({
+    token,
+    tokenExpira: { $gt: Date.now() },
+  });
+
+  if (!userBDD) {
+    return res.status(404).json({ msg: "Token inválido o expirado" });
+  }
+
   userBDD.password = await userBDD.encryptPassword(password);
+  userBDD.token = null;
+  userBDD.tokenExpira = null;
+
   await userBDD.save();
-  res
-    .status(200)
-    .json({
-      msg: "Felicitaciones, ya puedes iniciar sesión con tu nuevo password",
-    });
+
+  res.json({ msg: "Contraseña actualizada correctamente" });
 };
 
 const cambiarPasswordAdmin = async (req, res) => {
@@ -167,11 +197,9 @@ const cambiarPasswordAdmin = async (req, res) => {
 
     const adminUser = await users.findOne({ email });
     if (!adminUser) {
-      return res
-        .status(404)
-        .json({
-          msg: "Ejecuta el script de creación de administrador primero",
-        });
+      return res.status(404).json({
+        msg: "Ejecuta el script de creación de administrador primero",
+      });
     }
 
     adminUser.password = await adminUser.encryptPassword(newPassword);
@@ -213,11 +241,9 @@ const generarNuevaPasswordAdmin = async (req, res) => {
     // Buscar al administrador (debe existir por tu script)
     const adminUser = await users.findOne({ email });
     if (!adminUser) {
-      return res
-        .status(404)
-        .json({
-          msg: "Administrador no encontrado. Ejecuta el script de creación primero.",
-        });
+      return res.status(404).json({
+        msg: "Administrador no encontrado. Ejecuta el script de creación primero.",
+      });
     }
 
     // Generar nueva contraseña (sin token)
@@ -261,11 +287,9 @@ const login = async (req, res) => {
       userBDD.confirmEmail === false &&
       userBDD.email !== "admin@epn.edu.ec"
     ) {
-      return res
-        .status(403)
-        .json({
-          msg: "Lo sentimos, debes confirmar tu cuenta antes de iniciar sesión",
-        });
+      return res.status(403).json({
+        msg: "Lo sentimos, debes confirmar tu cuenta antes de iniciar sesión",
+      });
     }
     const verficarPassword = await userBDD.matchPassword(password);
     if (!verficarPassword) {
@@ -314,7 +338,7 @@ const perfil = (req, res) => {
 };
 
 const logout = (req, res) => {
-  return res.status(200).json({ msg: 'Sesión cerrada exitosamente' });
+  return res.status(200).json({ msg: "Sesión cerrada exitosamente" });
 };
 
 const actualizarPerfilAdmin = async (req, res) => {
@@ -334,11 +358,9 @@ const actualizarPerfilAdmin = async (req, res) => {
   if (userBDD.email != email) {
     const userBDD = await users.findOne({ email });
     if (userBDDMail) {
-      return res
-        .status(404)
-        .json({
-          msg: `Lo sentimos, el email existe ya se encuentra registrado`,
-        });
+      return res.status(404).json({
+        msg: `Lo sentimos, el email existe ya se encuentra registrado`,
+      });
     }
   }
 
@@ -370,7 +392,7 @@ const listarEstudiantes = async (req, res) => {
     const estudiantes = await users
       .find({ rol: "estudiante" })
       .select(
-        "_id nombre apellido email fechaNacimiento createdAt imagenPerfil"
+        "_id nombre apellido email fechaNacimiento createdAt imagenPerfil",
       );
 
     res.status(200).json(estudiantes);
@@ -443,15 +465,15 @@ const crearEvento = async (req, res) => {
 
     await evento.save();
 
-    const estudiantes = await users.find({ rol: 'estudiante' }).select('_id');
-    const notificaciones = estudiantes.map(u => ({
+    const estudiantes = await users.find({ rol: "estudiante" }).select("_id");
+    const notificaciones = estudiantes.map((u) => ({
       usuario: u._id,
-      tipo: 'evento',
-      titulo: 'Nuevo evento disponible',
+      tipo: "evento",
+      titulo: "Nuevo evento disponible",
       mensaje: `El administrador creó un nuevo evento: ${titulo}`,
       leido: false,
       createdAt: new Date(),
-      updatedAt: new Date()
+      updatedAt: new Date(),
     }));
     if (notificaciones.length) {
       await HistorialNotificacion.insertMany(notificaciones);
@@ -504,12 +526,12 @@ const actualizarEvento = async (req, res) => {
 const obtenerEventosAdmin = async (req, res) => {
   try {
     const eventosRaw = await Evento.find({ activo: true })
-      .populate('asistentes', 'nombre apellido')
+      .populate("asistentes", "nombre apellido")
       .select("-__v -createdAt -updatedAt -creador")
       .lean();
 
     // Transformamos para asegurar que _id es string
-    const eventos = eventosRaw.map(evento => ({
+    const eventos = eventosRaw.map((evento) => ({
       ...evento,
       _id: evento._id.toString(),
     }));
@@ -520,8 +542,6 @@ const obtenerEventosAdmin = async (req, res) => {
     res.status(500).json({ msg: "Error al obtener eventos" });
   }
 };
-
-
 
 const eliminarEvento = async (req, res) => {
   try {
@@ -548,21 +568,174 @@ const verMisStrikes = async (req, res) => {
     const usuario = req.userBDD;
 
     if (!usuario || usuario.rol !== "admin") {
-      return res
-        .status(403)
-        .json({
-          msg: "Acceso denegado: solo los administradores pueden ver estos datos.",
-        });
+      return res.status(403).json({
+        msg: "Acceso denegado: solo los administradores pueden ver estos datos.",
+      });
     }
 
-    const strikes = await Strike.find({ para: usuario._id })
-      .populate("de", "nombre apellido correo") // quién envió
+    // Admin ve TODOS los strikes de todos los estudiantes
+    const strikes = await Strike.find({})
+      .populate("de", "nombre apellido email") // quién envió
+      .populate("para", "nombre apellido email") // a quién (admin)
+      .populate("usuarioReportado", "nombre apellido email")
+      .populate("chat")
       .sort({ fecha: -1 });
 
     res.status(200).json(strikes);
   } catch (error) {
-    console.error("Error al obtener mensajes del admin:", error);
-    res.status(500).json({ msg: "Error interno al obtener mensajes." });
+    console.error("Error al obtener strikes:", error);
+    res.status(500).json({ msg: "Error interno al obtener strikes." });
+  }
+};
+
+const responderStrike = async (req, res) => {
+  try {
+    const { strikeId } = req.params;
+    const { respuesta } = req.body;
+    const usuario = req.userBDD;
+
+    // Validar que sea admin
+    if (!usuario || usuario.rol !== "admin") {
+      return res.status(403).json({
+        msg: "Acceso denegado: solo los administradores pueden responder strikes.",
+      });
+    }
+
+    // Validar campos obligatorios
+    if (!strikeId || !respuesta || respuesta.trim().length < 5) {
+      return res.status(400).json({
+        msg: "Strike ID y respuesta (mínimo 5 caracteres) son obligatorios",
+      });
+    }
+
+    // Buscar el strike
+    const strike = await Strike.findById(strikeId).populate("de", "_id");
+    if (!strike) {
+      return res.status(404).json({ msg: "Strike no encontrado" });
+    }
+
+    // Verificar que el strike va dirigido al admin actual
+    if (strike.para.toString() !== usuario._id.toString()) {
+      return res
+        .status(403)
+        .json({ msg: "No puedes responder strikes de otros admins" });
+    }
+
+    // Actualizar el strike con la respuesta
+    strike.respuesta = respuesta.trim();
+    strike.respondido = true;
+    strike.fechaRespuesta = new Date();
+    await strike.save();
+
+    // Crear notificación para el usuario que hizo el strike
+    await HistorialNotificacion.create({
+      usuario: strike.de._id,
+      fromUser: usuario._id,
+      tipo: "respuesta_strike",
+      titulo: "Respuesta del Equipo de Soporte",
+      mensaje: `El equipo de soporte de Amikuna ha respondido a tu ${strike.tipo}: "${respuesta}"`,
+    });
+
+    return res.status(200).json({
+      msg: "Respuesta enviada exitosamente",
+      strike,
+    });
+  } catch (error) {
+    console.error("Error al responder strike:", error);
+    res.status(500).json({ msg: "Error interno del servidor" });
+  }
+};
+
+const obtenerDenunciaDetalle = async (req, res) => {
+  try {
+    const usuario = req.userBDD;
+    if (!usuario || usuario.rol !== "admin") {
+      return res
+        .status(403)
+        .json({ msg: "Acceso denegado: solo administradores" });
+    }
+
+    const { strikeId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(strikeId)) {
+      return res.status(400).json({ msg: "ID de strike inválido" });
+    }
+
+    const strike = await Strike.findById(strikeId)
+      .populate("de", "nombre apellido email")
+      .populate("usuarioReportado", "nombre apellido email")
+      .populate({
+        path: "chat",
+        populate: {
+          path: "mensajes.emisor",
+          select: "nombre apellido email",
+        },
+      });
+
+    if (!strike) {
+      return res.status(404).json({ msg: "Strike no encontrado" });
+    }
+
+    return res.status(200).json({ strike });
+  } catch (error) {
+    console.error("Error al obtener detalle de denuncia:", error);
+    return res
+      .status(500)
+      .json({ msg: "Error interno al obtener detalle de denuncia" });
+  }
+};
+
+const eliminarMatchYChat = async (req, res) => {
+  try {
+    const usuario = req.userBDD;
+    if (!usuario || usuario.rol !== "admin") {
+      return res
+        .status(403)
+        .json({ msg: "Acceso denegado: solo administradores" });
+    }
+
+    const { strikeId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(strikeId)) {
+      return res.status(400).json({ msg: "ID de strike inválido" });
+    }
+
+    const strike = await Strike.findById(strikeId);
+    if (!strike || !strike.usuarioReportado || !strike.chat) {
+      return res
+        .status(404)
+        .json({ msg: "Strike o datos asociados no encontrados" });
+    }
+
+    const chat = await Chat.findByIdAndDelete(strike.chat);
+
+    await users.findByIdAndUpdate(strike.de, {
+      $pull: {
+        matches: strike.usuarioReportado,
+        siguiendo: strike.usuarioReportado,
+        seguidores: strike.usuarioReportado,
+      },
+    });
+
+    await users.findByIdAndUpdate(strike.usuarioReportado, {
+      $pull: {
+        matches: strike.de,
+        siguiendo: strike.de,
+        seguidores: strike.de,
+      },
+    });
+
+    strike.status = "resuelto";
+    await strike.save();
+
+    return res.status(200).json({
+      msg: "Match y chat eliminados con éxito",
+      chatEliminado: !!chat,
+      strike,
+    });
+  } catch (error) {
+    console.error("Error eliminando match/chat:", error);
+    return res
+      .status(500)
+      .json({ msg: "Error interno al eliminar match y chat" });
   }
 };
 
@@ -585,4 +758,7 @@ export {
   actualizarEvento,
   eliminarEvento,
   verMisStrikes,
+  obtenerDenunciaDetalle,
+  eliminarMatchYChat,
+  responderStrike,
 };

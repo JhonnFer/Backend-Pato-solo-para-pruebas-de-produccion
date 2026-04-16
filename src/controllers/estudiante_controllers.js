@@ -3,18 +3,14 @@ import users from '../models/users.js';
 import { v2 as cloudinary } from 'cloudinary';
 import fs from 'fs-extra';
 import { generarConRetry, getModel } from "../helpers/gemini_helper.js";
-import path from 'path';
-import { v4 as uuidv4 } from 'uuid';
 import Evento from '../models/Evento.js';
-import { Stripe } from "stripe"
 import Chat from '../models/chats.js';
 import Aporte from '../models/Aporte.js';
 import { injectIO } from "../middlewares/injectIO.js";
 import Strike from '../models/strikes.js';
 import HistorialConChatbot from "../models/historialConChatbot.js";
 import HistorialNotificacion from '../models/HistorialNotificacion.js';
-
-const stripe = new Stripe(`${process.env.STRIPE_PRIVATE_KEY}`)
+import fetch from "node-fetch"
 
 const getCloudinaryPublicIdFromUrl = (url) => {
   if (!url || typeof url !== 'string') return null;
@@ -58,6 +54,30 @@ const crearNotificacion = async ({ usuarioId, fromUserId = null , tipo, titulo, 
   }
 };
 
+const crearChatMatch = async (usuarioAId, usuarioBId, io) => {
+  try {
+    const sortedIds = [usuarioAId.toString(), usuarioBId.toString()].sort();
+    let chat = await Chat.findOne({ participantes: sortedIds });
+    if (!chat) {
+      chat = await Chat.create({ participantes: sortedIds, mensajes: [] });
+      if (io) {
+        io.to(usuarioAId.toString()).emit('chat:created', {
+          chatId: chat._id,
+          otherUserId: usuarioBId
+        });
+        io.to(usuarioBId.toString()).emit('chat:created', {
+          chatId: chat._id,
+          otherUserId: usuarioAId
+        });
+      }
+    }
+    return chat;
+  } catch (error) {
+    console.error('Error creando chat de match:', error);
+    throw error;
+  }
+};
+
 const obtenerNotificaciones = async (req, res) => {
   try {
     const usuarioId = req.userBDD._id;
@@ -75,23 +95,88 @@ const obtenerNotificaciones = async (req, res) => {
 const marcarNotificacionLeida = async (req, res) => {
   try {
     const { id } = req.params;
-    const usuarioId = req.userBDD._id;
+    const usuarioId = req.userBDD?._id;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ msg: 'ID de notificación inválido' });
+    }
+
+    if (!usuarioId) {
+      return res.status(401).json({ msg: 'Usuario no autenticado' });
+    }
 
     const notificacion = await HistorialNotificacion.findOne({ _id: id, usuario: usuarioId });
-    if (!notificacion) return res.status(404).json({ msg: 'Notificación no encontrada' });
+    if (!notificacion) {
+      return res.status(404).json({ msg: 'Notificación no encontrada o no perteneciente al usuario' });
+    }
+
+    if (notificacion.leido) {
+      return res.status(200).json({ msg: 'Notificación ya estaba marcada como leída', notificacion });
+    }
 
     notificacion.leido = true;
     await notificacion.save();
 
-    return res.status(200).json({ msg: 'Notificación marcada como leída' });
+    return res.status(200).json({ msg: 'Notificación marcada como leída', notificacion });
   } catch (error) {
     console.error('Error marcando notificación como leída:', error);
-    return res.status(500).json({ msg: 'Error al marcar notificación' });
+    return res.status(500).json({ msg: 'Error al marcar notificación', error: error.message });
   }
 };
 
 const logout = (req, res) => {
   return res.status(200).json({ msg: 'Sesión cerrada. Guarda el token localmente removido en frontend.' });
+};
+
+const marcarNotificacionLeidaPorStrike = async (req, res) => {
+  try {
+    const { strikeId } = req.params;
+    const usuarioId = req.userBDD?._id;
+
+    if (!mongoose.Types.ObjectId.isValid(strikeId)) {
+      return res.status(400).json({ msg: 'Strike ID inválido' });
+    }
+
+    const strike = await Strike.findById(strikeId);
+    if (!strike || strike.de.toString() !== usuarioId.toString()) {
+      return res.status(404).json({ msg: 'Strike no encontrado o no te pertenece' });
+    }
+
+    let notificacion = await HistorialNotificacion.findOne({
+      usuario: usuarioId,
+      tipo: 'respuesta_strike',
+      fromUser: strike.para,
+      mensaje: { $regex: strike.respuesta ? strike.respuesta.substring(0, 20) : '.*' }
+    });
+
+    if (!notificacion) {
+      // Si no existe notificación, la creamos como leída (para permitir marcarlo sin tener ID explicitamente)
+      notificacion = await HistorialNotificacion.create({
+        usuario: usuarioId,
+        fromUser: strike.para,
+        tipo: 'respuesta_strike',
+        titulo: 'Respuesta del Equipo de Soporte',
+        mensaje: strike.respuesta
+          ? `El equipo de soporte de Amikuna ha respondido a tu ${strike.tipo}: "${strike.respuesta}"`
+          : 'El equipo de soporte de Amikuna respondió tu solicitud.',
+        leido: true
+      });
+
+      return res.status(200).json({ msg: 'Notificación creada y marcada como leída', notificacion });
+    }
+
+    if (notificacion.leido) {
+      return res.status(200).json({ msg: 'Notificación ya estaba marcada como leída', notificacion });
+    }
+
+    notificacion.leido = true;
+    await notificacion.save();
+
+    return res.status(200).json({ msg: 'Notificación marcada como leída', notificacion });
+  } catch (error) {
+    console.error('Error marcando notificación por strike:', error);
+    return res.status(500).json({ msg: 'Error al marcar notificación por strike', error: error.message });
+  }
 };
 
 const completarPerfil = async (req, res) => {
@@ -288,13 +373,29 @@ const chatEstudiante = async (req, res) => {
     const model = getModel();
 
     const prompt = `
-Eres un asistente amigable en una app de citas llamada Amikuna. 
-Ayudas a los usuarios a iniciar conversaciones, mejorar sus perfiles y dar consejos de relaciones de manera divertida y respetuosa. 
+Eres un asistente amigable en una aplicación que promueve la interacción social llamada Amikuna. 
+Ayudas a los usuarios a iniciar conversaciones, respondes todo tipo de preguntas y ayudas en base a tu código fuente. 
 Responde siempre con un tono informal pero con buena ortografía.
-Recuerda que eres un chatbot y no puedes recibir mensajes de voz, imágenes o videos, solo texto y debes
-responder de esa manera sin la recepción de lo anteriormente mencionado solo texto (si puedes usar emojis).
+Recuerda que eres un chatbot y no puedes recibir mensajes de voz, imágenes o videos, solo texto y debes (si puedes usar emojis).
 Usa lenguaje natural, que no parezca escrito por una IA.
 Usa jerga y expresiones de Ecuador.
+Además, te voy a mapear la aplicación por si alguien no sabe como funciona y guíes por si no saben como funciona la aplicación web:
+Al principio cuando te registras hay un formulario que debes llenar con tu información personal sino no puedes ver a otros usuarios.
+En la parte izquierda verás "Tu perfil" donde está esa información que llenaste junto con tus seguidores y seguidos bajo esta parte 
+hay una galería de las fotos que has subido. 
+En la parte superior central tienes opciones como: Perfil el cual te ayuda a cambiar la información personal del formulario.
+Al lado de eso encontamos Fotos donde puedes subir, modificar, eliminar fotos de una galería (la que mencionamos hace un momento). 
+A un lado hay Notificaciones que te llegan cuando una persona te sigue, cuando el administrador crea eventos, cuando una persona te sigue de vuelta
+se crea el "match" y automáticamente se genera un chat para chatear con esa persona. Al lado derecho hay una parte llamada Chatbot donde se abre esta interfaz
+donde vas a leer el mensaje del usuario más adelante. Al lado derecho también dice "Feedback" donde puedes enviar quejas o sugerencias al administrador 
+y ver las enviadas junto con la respuesta del admin. A un lado de eso dice salir para cerrar la sesión.
+En la parte superior derecha encuentras los eventos creados por el administrador y un pequeño botón parte tienes "Mis eventos" y se ve los eventos 
+a los que accediste ir. En la parte central vas a ver los candidatos a match, es decir, personas que cumplen con tus preferencias y que no has visto antes para que puedas
+seguirlos o no seguirlos. Una vez que sigues a alguien esa persona recibe la notificación y puede seguirte de vuelta y si eso sucede se abre automáticamente 
+un chat que puedes ver en la parte derecha de la pantalla donde dice "Matches con quien chatear" y ahí pueden enviarse mensajes.
+Además, el chat tiene una banderita que dice "Reportar Usuario" y si te incomodó el chat debes enviar la denuncia y se eliminará el match una vez que el administrador 
+vea y decida que hacer (Por lo general una denuncia rompe el match y no puedes ver a esa persona de nuevo en la app). 
+En la parte de aportes se puede hacer un pago para ayudar a que AmiKuna mejore, el concepto es Aporte voluntario y es para gastarlo en mejorar la aplicación.
 
 Mensaje del usuario: "${mensaje}"
 `;
@@ -432,7 +533,7 @@ const seguirUsuario = async (req, res) => {
     if (!otro) return res.status(404).json({ msg: "Usuario no encontrado" });
 
     // Lógica de seguir/dejar de seguir (existente)
-    const yaLoSigo = yo.siguiendo.includes(idSeguido);
+    const yaLoSigo = yo.siguiendo.some(id => id.toString() === idSeguido);
     if (yaLoSigo) {
       yo.siguiendo.pull(idSeguido);
       otro.seguidores.pull(yoId);
@@ -445,7 +546,7 @@ const seguirUsuario = async (req, res) => {
       otro.seguidores.push(yoId);
       
       // Agregar a perfiles vistos
-      if (!yo.perfilesVistos.includes(idSeguido)) {
+      if (!yo.perfilesVistos.some(id => id.toString() === idSeguido)) {
         yo.perfilesVistos.push(idSeguido);
       }
 
@@ -461,11 +562,11 @@ const seguirUsuario = async (req, res) => {
 
     // Nuevo: Sistema de matches automáticos
     let huboMatch = false;
-    if (!yaLoSigo && otro.siguiendo.includes(yoId)) {
-      if (!yo.matches.includes(idSeguido)) {
+    if (!yaLoSigo && otro.siguiendo.some(id => id.toString() === yoId.toString())) {
+      if (!yo.matches.some(id => id.toString() === idSeguido)) {
         yo.matches.push(idSeguido);
       }
-      if (!otro.matches.includes(yoId)) {
+      if (!otro.matches.some(id => id.toString() === yoId.toString())) {
         otro.matches.push(yoId);
       }
       huboMatch = true;
@@ -483,14 +584,13 @@ const seguirUsuario = async (req, res) => {
         titulo: '¡Nuevo match!',
         mensaje: `¡Felicitaciones! Hiciste match con ${yo.nombre ?? 'alguien'}.`
       });
-
-      // Opcional: Crear chat (si tienes esta función)
-      if (req.io) {
-        await guardarMatch(yoId, idSeguido, req.io);
-      }
     }
 
     await Promise.all([yo.save(), otro.save()]);
+
+    if (huboMatch && req.io) {
+      await crearChatMatch(yoId, idSeguido, req.io);
+    }
 
     // Respuesta mejorada
     return res.status(200).json({
@@ -553,6 +653,42 @@ const obtenerEventos = async (req, res) => {
   }
 };
 
+const obtenerMisEventos = async (req, res) => {
+  try {
+    const userId = req.userBDD._id;
+
+    const eventosRaw = await Evento.find({ activo: true, asistentes: userId })
+      .populate('asistentes', 'nombre apellido imagenPerfil email')
+      .populate('noAsistiran', 'nombre apellido imagenPerfil email')
+      .populate('creador', 'nombre apellido email')
+      .select('-__v -createdAt -updatedAt')
+      .lean();
+
+    const eventos = eventosRaw.map(evento => ({
+      ...evento,
+      _id: evento._id.toString(),
+      asistentes: Array.isArray(evento.asistentes) ? evento.asistentes.map(a => ({
+        _id: a._id.toString(),
+        nombre: a.nombre,
+        apellido: a.apellido,
+        email: a.email,
+        imagenPerfil: a.imagenPerfil
+      })) : [],
+      noAsistiran: Array.isArray(evento.noAsistiran) ? evento.noAsistiran.map(n => ({
+        _id: n._id.toString(),
+        nombre: n.nombre,
+        apellido: n.apellido,
+        email: n.email,
+        imagenPerfil: n.imagenPerfil
+      })) : []
+    }));
+
+    res.status(200).json(eventos);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ msg: 'Error al obtener mis eventos' });
+  }
+};
 
 
 const confirmarAsistencia = async (req, res) => {
@@ -609,40 +745,119 @@ const rechazarAsistencia = async (req, res) => {
 
 /// NADA DOCUMENTADO DE AQUÍ EN ADELANTE PILAS
 
-const crearAporte = async (req, res) => {
+const getPayPalToken = async () => {
+  const credentials = Buffer.from(
+    `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_SECRET}`
+  ).toString("base64");
+
+  const res = await fetch(`${process.env.PAYPAL_URL}/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: "grant_type=client_credentials",
+  });
+
+  const data = await res.json();
+  return data.access_token;
+};
+
+const crearOrdenPayPal = async (req, res) => {
   try {
-    const { amount, paymentMethodId } = req.body;
+    const { amount } = req.body;
+
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ ok: false, mensaje: "Monto inválido" });
+    }
+
+    const token = await getPayPalToken();
+
+    const response = await fetch(`${process.env.PAYPAL_URL}/v2/checkout/orders`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        intent: "CAPTURE",
+        purchase_units: [{
+          amount: {
+            currency_code: "USD",
+            value: Number(amount).toFixed(2),
+          },
+          description: "Aporte para Amikuna",
+        }],
+        application_context: {
+          brand_name: "Amikuna",
+          user_action: "PAY_NOW",
+        }
+      }),
+    });
+
+    const order = await response.json();
+
+    if (!order.id) {
+      return res.status(500).json({ ok: false, mensaje: "Error creando orden en PayPal", detalle: order });
+    }
+
+    res.status(201).json({ ok: true, orderId: order.id });
+
+  } catch (error) {
+    console.error("Error creando orden PayPal:", error);
+    res.status(500).json({ ok: false, mensaje: error.message });
+  }
+};
+
+const capturarPagoPayPal = async (req, res) => {
+  try {
+    const { orderId, amount } = req.body;
     const userId = req.userBDD._id;
 
-    // 1. Crear intento de pago en Stripe
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amount * 100, // Stripe trabaja en centavos
-      currency: "usd",
-      payment_method: paymentMethodId,
-      confirm: true,
-      return_url: "https://amikuna.vercel.app/user/dashboard",
-    });
+    if (!orderId || !amount) {
+      return res.status(400).json({ ok: false, mensaje: "orderId y amount son requeridos" });
+    }
 
-    // 2. Guardar en la base de datos
-    const nuevoAporte = await Aporte.create({
+    const token = await getPayPalToken();
+
+    const response = await fetch(
+      `${process.env.PAYPAL_URL}/v2/checkout/orders/${orderId}/capture`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const capture = await response.json();
+
+    if (capture.status !== "COMPLETED") {
+      await Aporte.create({
+        userId,
+        amount,
+        paypalOrderId: orderId,
+        status: "fallido",
+      });
+      return res.status(400).json({ ok: false, mensaje: "Pago no completado", estado: capture.status });
+    }
+
+    await Aporte.create({
       userId,
       amount,
-      paymentIntentId: paymentIntent.id,
-      status: paymentIntent.status === "succeeded" ? "pagado" : "pendiente",
+      paypalOrderId: orderId,
+      status: "pagado",
     });
 
-    res.status(201).json({
+    res.status(200).json({
       ok: true,
-      mensaje: "Aporte creado exitosamente.",
-      aporte: nuevoAporte,
+      mensaje: "¡Aporte realizado con éxito! Gracias por apoyar Amikuna.",
     });
+
   } catch (error) {
-    console.error("Error al procesar aporte:", error);
-    res.status(500).json({
-      ok: false,
-      mensaje: "Error al crear el aporte.",
-      error: error.message,
-    });
+    console.error("Error capturando pago PayPal:", error);
+    res.status(500).json({ ok: false, mensaje: error.message });
   }
 };
 
@@ -741,7 +956,7 @@ const enviarMensaje = async (req, res) => {
         const ultimoMensaje = mensajeFinal.mensajes[mensajeFinal.mensajes.length - 1];
 
         if (req.io) {
-            req.io.to(chatId.toString()).emit('mensaje:nuevo', {
+            req.io.to(`chat_${chatId}`).emit('mensaje:nuevo', {
                 chatId,
                 mensaje: ultimoMensaje
             });
@@ -784,21 +999,81 @@ const obtenerMensajes = async (req, res) => {
   }
 };
 
-const enviarStrike = async (req, res) => {
+const reportarUsuarioChat = async (req, res) => {
+  try {
+    const chatId = req.params.chatId;
+    const usuarioId = req.userBDD._id;
+    const { razon } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(chatId)) {
+      return res.status(400).json({ msg: 'ID de chat inválido' });
+    }
+
+    if (!razon || razon.trim().length < 5) {
+      return res.status(400).json({ msg: 'Por favor describe el motivo con al menos 5 caracteres' });
+    }
+
+    const chat = await Chat.findById(chatId);
+    if (!chat) {
+      return res.status(404).json({ msg: 'Chat no encontrado' });
+    }
+
+    if (!chat.participantes.some(p => p.toString() === usuarioId.toString())) {
+      return res.status(403).json({ msg: 'No tienes permiso para reportar este chat' });
+    }
+
+    const usuarioReportado = chat.participantes.find(p => p.toString() !== usuarioId.toString());
+    if (!usuarioReportado) {
+      return res.status(400).json({ msg: 'No se pudo identificar al usuario reportado' });
+    }
+
+    const admin = await users.findOne({ email: 'admin@epn.edu.ec' });
+    if (!admin) {
+      return res.status(500).json({ msg: 'Administrador no encontrado en el sistema' });
+    }
+
+    const nuevoStrike = new Strike({
+      de: usuarioId,
+      para: admin._id,
+      tipo: 'denuncia',
+      razon: razon.trim(),
+      usuarioReportado,
+      chat: chat._id,
+      status: 'pendiente'
+    });
+
+    await nuevoStrike.save();
+
+    await HistorialNotificacion.create({
+      usuario: admin._id,
+      fromUser: usuarioId,
+      tipo: 'denuncia',
+      titulo: 'Nueva denuncia de usuario',
+      mensaje: `El usuario con ID ${usuarioId} reportó al usuario con ID ${usuarioReportado} en el chat ${chat._id}`
+    });
+
+    return res.status(201).json({ msg: 'Denuncia enviada correctamente', strike: nuevoStrike });
+  } catch (error) {
+    console.error('Error al reportar usuario:', error);
+    return res.status(500).json({ msg: 'Error interno al reportar usuario' });
+  }
+};
+
+const   enviarStrike = async (req, res) => {
   try {
     const de = req.userBDD._id;
     const { tipo, razon } = req.body;
 
     // Buscar el ID del admin quemado
-    const admin = await users.findOne({ correo: 'admin@epn.edu.ec' });
+    const admin = await users.findOne({ email: 'admin@epn.edu.ec' });
 
     if (!admin) {
       return res.status(500).json({ msg: 'Administrador no encontrado en el sistema' });
     }
 
     // Validaciones
-    if (!['queja', 'sugerencia'].includes(tipo)) {
-      return res.status(400).json({ msg: "Tipo debe ser 'queja' o 'sugerencia'" });
+    if (!['queja', 'sugerencia', 'denuncia'].includes(tipo)) {
+      return res.status(400).json({ msg: "Tipo debe ser 'queja', 'sugerencia' o 'denuncia'" });
     }
 
     if (!razon || razon.trim().length < 5) {
@@ -825,6 +1100,25 @@ const enviarStrike = async (req, res) => {
   }
 };
 
+const verMisStrikes = async (req, res) => {
+  try {
+    const usuarioId = req.userBDD._id;
+
+    const strikes = await Strike.find({ de: usuarioId })
+      .populate('para', 'nombre apellido email')
+      .sort({ fecha: -1 })
+      .lean();
+
+    res.status(200).json({ 
+      msg: "Consulta realizada exitosamente",
+      strikes 
+    });
+  } catch (error) {
+    console.error("Error al obtener strikes:", error);
+    res.status(500).json({ msg: "Error al obtener tus quejas/sugerencias" });
+  }
+};
+
 
 export { 
   completarPerfil,
@@ -832,21 +1126,27 @@ export {
   eliminarFotoGaleria,
   reemplazarFotoGaleria,
   chatEstudiante,
-  obtenerPerfilCompleto, 
+  obtenerPerfilCompleto,
   listarPotencialesMatches,
   seguirUsuario,
   listarMatches,
   obtenerEventos,
+  obtenerMisEventos,
   confirmarAsistencia,
   rechazarAsistencia,
   obtenerNotificaciones,
   marcarNotificacionLeida,
+  marcarNotificacionLeidaPorStrike,
   logout,
-  crearAporte,
+  getPayPalToken,
+  crearOrdenPayPal,
+  capturarPagoPayPal,
   iniciarChat,
   enviarMensaje,
   obtenerMensajes,
+  reportarUsuarioChat,
   enviarStrike,
-  obtenerHistorialChatbot
+  obtenerHistorialChatbot,
+  verMisStrikes
 }
 
