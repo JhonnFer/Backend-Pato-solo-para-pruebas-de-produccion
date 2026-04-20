@@ -11,7 +11,43 @@ import HistorialNotificacion from "../models/HistorialNotificacion.js";
 
 //nuevas importaciones para correos reemplaxo de nodemailer por supabase
 import supabase from "../config/supabase.js";
+import Tesoreria from "../models/Tesoreria.js";
+import Aporte from "../models/Aporte.js";
 import crypto from "crypto";
+
+const validarHora = (hora) => {
+  if (!hora || typeof hora !== 'string') return false;
+  return /^([01]\d|2[0-3]):([0-5]\d)$/.test(hora);
+};
+
+const validarFechaHoraEvento = (fecha, hora) => {
+  if (!fecha || !hora) {
+    return 'La fecha y hora del evento son obligatorias.';
+  }
+
+  if (!validarHora(hora)) {
+    return 'La hora debe tener el formato HH:mm válido.';
+  }
+
+  const fechaHoraEvento = new Date(`${fecha}T${hora}:00`);
+  if (Number.isNaN(fechaHoraEvento.getTime())) {
+    return 'Fecha o hora del evento inválida.';
+  }
+
+  const ahora = new Date();
+  const fechaEventoSolo = new Date(fechaHoraEvento.toDateString());
+  const hoySolo = new Date(ahora.toDateString());
+
+  if (fechaEventoSolo < hoySolo) {
+    return 'No se pueden crear eventos con fecha anterior a hoy.';
+  }
+
+  if (fechaEventoSolo.getTime() === hoySolo.getTime() && fechaHoraEvento < ahora) {
+    return 'No se pueden crear eventos con hora anterior a la hora actual.';
+  }
+
+  return null;
+};
 
 // registro para que supabase use su sistema de correo en lugar del nuestro, pero manteniendo la lógica de creación de usuario en MongoDB y el token personalizado.
 
@@ -38,7 +74,6 @@ const registro = async (req, res) => {
   newUser.crearToken();
   await newUser.save();
 
-  // Enviar correo via Supabase — NUEVO
   try {
     const confirmationLink = `${process.env.URL_FRONTEND}/confirmar/${newUser.token}`;
 
@@ -52,9 +87,9 @@ const registro = async (req, res) => {
 
     if (error) throw error;
 
-    console.log("✅ Email de confirmación enviado:", email);
+    console.log("Email de confirmación enviado:", email);
   } catch (error) {
-    console.error("❌ Error enviando correo:", error.message);
+    console.error("Error enviando correo:", error.message);
     return res.status(500).json({
       msg: "Usuario registrado pero hubo un problema al enviar el correo.",
     });
@@ -76,9 +111,6 @@ const confirmarMail = async (req, res) => {
   res.status(200).json({ msg: "Token confirmado, ya puedes iniciar sesión" });
 };
 
-
-
-
 const recuperarPassword = async (req, res) => {
   const { email } = req.body;
 
@@ -86,37 +118,36 @@ const recuperarPassword = async (req, res) => {
     return res.status(400).json({ msg: "El correo es obligatorio" });
   }
 
-  const userBDD = await users.findOne({ email });
-  if (!userBDD) {
-    return res.status(404).json({ msg: "Usuario no registrado" });
-  }
-
-  //  Generar token seguro
-  const token = crypto.randomBytes(32).toString("hex");
-
-  userBDD.token = token;
-  userBDD.tokenExpira = Date.now() + 1000 * 60 * 60; // 1 hora
-  await userBDD.save();
-
-  //  Link REAL de tu sistema
-  const recoveryLink = `${process.env.URL_FRONTEND}/nuevopassword/${token}`;
-
   try {
-    //  Usamos Supabase SOLO para disparar el correo
-    await supabase.auth.signInWithOtp({
-      email,
-      options: {
-        emailRedirectTo: recoveryLink,
-      },
+    const userBDD = await users.findOne({ email });
+    if (!userBDD) {
+      return res.status(404).json({ msg: "Usuario no registrado" });
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    userBDD.token = token;
+    userBDD.tokenExpira = Date.now() + 1000 * 60 * 60;
+    await userBDD.save();
+
+    const recoveryLink = `${process.env.URL_FRONTEND}/nuevopassword/${token}`;
+
+    // ✅ Método correcto para recuperar password en Supabase
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: recoveryLink,
     });
+
+    if (error) {
+      console.error("Error Supabase:", error.message);
+      return res.status(500).json({ msg: "Error enviando correo" });
+    }
 
     return res.status(200).json({
       msg: "Revisa tu correo para recuperar tu contraseña",
     });
+
   } catch (error) {
-    return res.status(500).json({
-      msg: "Error enviando correo",
-    });
+    console.error("Error recuperando password:", error);
+    return res.status(500).json({ msg: "Error enviando correo" });
   }
 };
 
@@ -167,39 +198,19 @@ const crearNuevoPassword = async (req, res) => {
 
 const cambiarPasswordAdmin = async (req, res) => {
   try {
-    const { email, masterKey, securityAnswer, newPassword, confirmPassword } =
-      req.body;
+    const { newPassword, confirmPassword } = req.body;
 
-    // Validaciones
-    if (
-      !email ||
-      !masterKey ||
-      !securityAnswer ||
-      !newPassword ||
-      !confirmPassword
-    ) {
+    if (!newPassword || !confirmPassword) {
       return res.status(400).json({ msg: "Todos los campos son obligatorios" });
     }
-    if (email !== "admin@epn.edu.ec") {
-      return res
-        .status(403)
-        .json({ msg: "Acceso denegado. Solo para administradores" });
-    }
-    if (masterKey !== process.env.ADMIN_MASTER_KEY) {
-      return res.status(403).json({ msg: "Clave maestra incorrecta" });
-    }
-    if (securityAnswer !== "2025-A") {
-      return res.status(403).json({ msg: "Respuesta de seguridad incorrecta" });
-    }
+
     if (newPassword !== confirmPassword) {
       return res.status(400).json({ msg: "Las contraseñas no coinciden" });
     }
 
-    const adminUser = await users.findOne({ email });
+    const adminUser = await users.findOne({ correo: "admin@epn.edu.ec" });
     if (!adminUser) {
-      return res.status(404).json({
-        msg: "Ejecuta el script de creación de administrador primero",
-      });
+      return res.status(404).json({ msg: "Administrador no encontrado" });
     }
 
     adminUser.password = await adminUser.encryptPassword(newPassword);
@@ -208,60 +219,6 @@ const cambiarPasswordAdmin = async (req, res) => {
     res.status(200).json({ msg: "Contraseña actualizada exitosamente" });
   } catch (error) {
     console.error("Error en cambiarPasswordAdmin:", error);
-    res.status(500).json({ msg: "Error interno del servidor" });
-  }
-};
-
-const generarNuevaPasswordAdmin = async (req, res) => {
-  try {
-    const { email, masterKey, securityAnswer } = req.body;
-
-    // Validar campos obligatorios
-    if (!email || !masterKey || !securityAnswer) {
-      return res.status(400).json({ msg: "Todos los campos son obligatorios" });
-    }
-
-    // Validar que es el email del administrador
-    if (email !== "admin@epn.edu.ec") {
-      return res
-        .status(403)
-        .json({ msg: "Acceso denegado. Solo para administradores" });
-    }
-
-    // Validar la clave maestra
-    if (masterKey !== process.env.ADMIN_MASTER_KEY) {
-      return res.status(403).json({ msg: "Clave maestra incorrecta" });
-    }
-
-    // Validar la pregunta de seguridad
-    if (securityAnswer !== "2025-A") {
-      return res.status(403).json({ msg: "Respuesta de seguridad incorrecta" });
-    }
-
-    // Buscar al administrador (debe existir por tu script)
-    const adminUser = await users.findOne({ email });
-    if (!adminUser) {
-      return res.status(404).json({
-        msg: "Administrador no encontrado. Ejecuta el script de creación primero.",
-      });
-    }
-
-    // Generar nueva contraseña (sin token)
-    const nuevaPassword =
-      "Admin" + Math.random().toString(36).slice(2, 10) + "!";
-
-    // Actualizar contraseña (encriptada)
-    adminUser.password = await adminUser.encryptPassword(nuevaPassword);
-    await adminUser.save();
-
-    res.status(200).json({
-      msg: "Nueva contraseña generada exitosamente",
-      nuevaPassword: nuevaPassword,
-      warning:
-        "Guarda esta contraseña inmediatamente. No se mostrará nuevamente.",
-    });
-  } catch (error) {
-    console.error("Error en generarNuevaPasswordAdmin:", error);
     res.status(500).json({ msg: "Error interno del servidor" });
   }
 };
@@ -298,6 +255,9 @@ const login = async (req, res) => {
         .json({ msg: "Lo sentimos, el password es incorrecto" });
     }
     const token = crearTokenJWT(userBDD._id, userBDD.rol);
+    userBDD.token = token;   // ← guardar en DB
+    await userBDD.save(); 
+    
     const { _id, nombre, apellido, email: userEmail, rol } = userBDD;
 
     return res.status(200).json({
@@ -424,6 +384,8 @@ const eliminarEstudiante = async (req, res) => {
     }
 
     await users.findByIdAndDelete(id);
+    // Emitir evento de eliminación
+    req.io.emit("estudiante_eliminado", { id });
     res.status(200).json({ msg: "Estudiante eliminado correctamente" });
   } catch (error) {
     console.error(error);
@@ -438,6 +400,10 @@ const crearEvento = async (req, res) => {
 
     if (!titulo || !descripcion || !fecha || !hora || !lugar) {
       return res.status(400).json({ msg: "Todos los campos son obligatorios" });
+    }
+    const errorValidacion = validarFechaHoraEvento(fecha, hora);
+    if (errorValidacion) {
+      return res.status(400).json({ msg: errorValidacion });
     }
 
     let imagen = "";
@@ -478,6 +444,9 @@ const crearEvento = async (req, res) => {
     if (notificaciones.length) {
       await HistorialNotificacion.insertMany(notificaciones);
     }
+    //Emitir a todos los clientes conectados
+    req.io.emit("evento_creado", { evento })
+    req.io.emit("notificacion_nueva")  // refresca el badge de notificaciones
 
     res.status(201).json({ msg: "Evento creado correctamente", evento });
   } catch (error) {
@@ -496,7 +465,14 @@ const actualizarEvento = async (req, res) => {
     if (!evento) {
       return res.status(404).json({ msg: "Evento no encontrado" });
     }
-
+    if (fecha || hora) {
+      const fechaParaValidar = fecha ? fecha : evento.fecha.toISOString().split("T")[0];
+      const horaParaValidar = hora ? hora : evento.hora;
+      const errorValidacion = validarFechaHoraEvento(fechaParaValidar, horaParaValidar);
+      if (errorValidacion) {
+        return res.status(400).json({ msg: errorValidacion });
+      }
+    }
     // Actualiza campos si vienen en el body
     if (titulo) evento.titulo = titulo;
     if (descripcion) evento.descripcion = descripcion;
@@ -515,6 +491,9 @@ const actualizarEvento = async (req, res) => {
     }
 
     await evento.save();
+     //Emitir actualización
+    req.io.emit("evento_actualizado", { evento })
+
 
     res.status(200).json({ msg: "Evento actualizado correctamente", evento });
   } catch (error) {
@@ -535,7 +514,7 @@ const obtenerEventosAdmin = async (req, res) => {
       ...evento,
       _id: evento._id.toString(),
     }));
-
+    req.io.emit("eventos_actualizados", { eventos }) // Emitir lista actualizada a admin
     res.status(200).json(eventos);
   } catch (error) {
     console.error(error);
@@ -555,6 +534,23 @@ const eliminarEvento = async (req, res) => {
 
     evento.activo = false;
     await evento.save();
+
+    const asistentes = Array.isArray(evento.asistentes) ? evento.asistentes : [];
+    if (asistentes.length > 0) {
+      const notificaciones = asistentes.map((usuarioId) => ({
+        usuario: usuarioId,
+        fromUser: req.userBDD?._id || null,
+        tipo: 'evento',
+        titulo: 'Evento cancelado',
+        mensaje: `El evento "${evento.titulo}" ha sido cancelado.`,
+        leido: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }));
+      await HistorialNotificacion.insertMany(notificaciones);
+    }
+     //Emitir eliminación
+    req.io.emit("evento_eliminado", { id })
 
     res.status(200).json({ msg: "Evento eliminado (ocultado) correctamente" });
   } catch (error) {
@@ -626,6 +622,8 @@ const responderStrike = async (req, res) => {
     strike.respondido = true;
     strike.fechaRespuesta = new Date();
     await strike.save();
+    // responderStrike — notifica al estudiante afectado (revision)
+    req.io.emit("notificacion_nueva");
 
     // Crear notificación para el usuario que hizo el strike
     await HistorialNotificacion.create({
@@ -725,6 +723,8 @@ const eliminarMatchYChat = async (req, res) => {
 
     strike.status = "resuelto";
     await strike.save();
+    //eliminarMatch — notifica a ambos usuarios
+    req.io.emit("match_eliminado", { id })
 
     return res.status(200).json({
       msg: "Match y chat eliminados con éxito",
@@ -739,6 +739,101 @@ const eliminarMatchYChat = async (req, res) => {
   }
 };
 
+const verTesoreria = async (req, res) => {
+  try {
+    const tesoreria = await Tesoreria.findOne();
+    const aportes = await Aporte.find({ status: "pagado" })
+      .populate("userId", "nombre apellido correo")
+      .sort({ createdAt: -1 });
+
+    const totalAportes = aportes.reduce((acc, a) => acc + a.amount, 0);
+
+    res.status(200).json({
+      saldoDisponible: tesoreria?.saldoTotal ?? 0,
+      totalRecaudado: totalAportes,
+      totalMovimientos: tesoreria?.movimientos?.length ?? 0,
+      movimientos: tesoreria?.movimientos ?? [],
+      aportes
+    });
+  } catch (error) {
+    res.status(500).json({ msg: "Error al obtener tesorería", error: error.message });
+  }
+};
+
+// Registrar un gasto — resta del saldo y guarda la razón
+const registrarGasto = async (req, res) => {
+  try {
+    const { monto, razon } = req.body;
+
+    if (!monto || monto <= 0) {
+      return res.status(400).json({ msg: "Monto inválido" });
+    }
+    if (!razon || razon.trim().length < 3) {
+      return res.status(400).json({ msg: "Debes especificar una razón" });
+    }
+
+    const tesoreria = await Tesoreria.findOne();
+    if (!tesoreria) {
+      return res.status(404).json({ msg: "No hay tesorería inicializada aún" });
+    }
+
+    if (tesoreria.saldoTotal < monto) {
+      return res.status(400).json({
+        msg: `Saldo insuficiente. Disponible: $${tesoreria.saldoTotal}`
+      });
+    }
+
+    tesoreria.saldoTotal -= monto;
+    tesoreria.movimientos.push({
+      tipo: "gasto",
+      monto,
+      razon: razon.trim()
+    });
+
+    await tesoreria.save();
+
+    res.status(200).json({
+      msg: "Gasto registrado correctamente",
+      saldoActual: tesoreria.saldoTotal
+    });
+  } catch (error) {
+    res.status(500).json({ msg: "Error al registrar gasto", error: error.message });
+  }
+};
+
+// Ajuste manual — por si necesitas corregir el saldo a mano
+const ajustarSaldo = async (req, res) => {
+  try {
+    const { monto, razon } = req.body;
+
+    if (!razon || razon.trim().length < 3) {
+      return res.status(400).json({ msg: "Debes especificar una razón" });
+    }
+
+    let tesoreria = await Tesoreria.findOne();
+    if (!tesoreria) {
+      tesoreria = await Tesoreria.create({ saldoTotal: 0, movimientos: [] });
+    }
+
+    const tipo = monto >= 0 ? "ingreso" : "gasto";
+    tesoreria.saldoTotal += monto; 
+    tesoreria.movimientos.push({
+      tipo,
+      monto: Math.abs(monto),
+      razon: razon.trim()
+    });
+
+    await tesoreria.save();
+
+    res.status(200).json({
+      msg: "Saldo ajustado correctamente",
+      saldoActual: tesoreria.saldoTotal
+    });
+  } catch (error) {
+    res.status(500).json({ msg: "Error al ajustar saldo", error: error.message });
+  }
+};
+
 export {
   registro,
   confirmarMail,
@@ -746,7 +841,6 @@ export {
   comprobarTokenPasword,
   crearNuevoPassword,
   cambiarPasswordAdmin,
-  generarNuevaPasswordAdmin,
   login,
   perfil,
   logout,
@@ -761,4 +855,7 @@ export {
   obtenerDenunciaDetalle,
   eliminarMatchYChat,
   responderStrike,
+  verTesoreria,
+  registrarGasto,
+  ajustarSaldo
 };

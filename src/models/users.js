@@ -19,9 +19,7 @@ const userSchema = new Schema({
   },
   password: {
     type: String,
-     required: function() {
-        return !this.googleId; // true si no hay googleId, false si sí lo hay
-    }
+    required: true
   },
   rol: {
     type: String,
@@ -91,13 +89,8 @@ const userSchema = new Schema({
   },
   token: {
     type: String,
-    default: false
+    default: null
   }, 
-  googleId: {
-    type: String,
-    unique: true,
-    sparse: true // Permite múltiples documentos con googleId null
-  },
 }, {
   timestamps: true
 });
